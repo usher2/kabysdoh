@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+
+from ipaddress import IPv4Network, IPv4Address, IPv6Network, IPv6Address
+import gzip
+import json
+import os
+import sys
+import tempfile
+import time
+import xml.etree.cElementTree as ET
+
+SHA1_HEXDIGEST_LEN = 40
+JSONZ_SUFFIX = '.kabysdoh.json'
+# Lua has a limit of 2^18 constants per function. See the following pages for details:
+# http://boston.conman.org/2009/11/09.2 & http://lua-users.org/lists/lua-l/2008-02/msg00257.html
+# This hack is needed as a workaround for "lua: constant table overflow" error for 170k v4 + 97k v6.
+# If the value is too low, we might hit another limit. E.g. 2**10 _may_ give the following error
+# if every function is a new local variable:
+#   lua: dat.lua:199591: main function has more than 200 local variables
+LUA_CHUNK = 2 ** 16
+
+def parse_src(src):
+    ip4, net4 = set(), set()
+    ip6, net6 = set(), set()
+    for fname in src:
+        with gzip.open(fname, 'rt', encoding='utf-8') as fd:
+            doc = json.load(fd)
+            for src, dst in (
+                ('ip', ip4),
+                ('ipSubnet', net4),
+                ('ipv6', ip6),
+                ('ipv6Subnet', net6),
+            ):
+                for _ in doc[src]:
+                    dst.add(_)
+    return ip4, net4, ip6, net6
+
+def prune_src(src):
+    # a 10-byte header: {\x1f\x8b\x08, 1:flags, 4:timestamp, 1:xflags, \xff} + {fname, \x00}
+    # a 8-byte trailer: CRC-32 checksum and the length of the original uncompressed data
+    magic = JSONZ_SUFFIX.encode('latin-1') + b'\x00'
+    known = set()
+    ret = []
+    for fname in src:
+        with open(fname, 'rb') as fd:
+            head = fd.read(10 + SHA1_HEXDIGEST_LEN + len(magic))
+            if head[-len(magic):] != magic:
+                raise RuntimeError('Unexpected magic', head[-len(magic):], magic)
+            if head not in known:
+                known.add(head)
+                ret.append(fname)
+    return ret
+
+def make_32bit_trie(net, IPxxNetwork):
+    assert isinstance(net, set)
+    default = {
+        IPv4Network: '0.0.0.0/32',
+        IPv6Network: '::/32', # The minimum [RIPE] allocation size for IPv6 address space is /32.
+    }[IPxxNetwork]
+    discard = { IPv4Network: 0, IPv6Network: 96 }[IPxxNetwork]
+    net = sorted(IPxxNetwork(_) for _ in net)
+    prefix = min(net, default=IPxxNetwork(default), key=lambda n: n.prefixlen).prefixlen
+    prefix = min(prefix, 32)
+    trie_mask = ((0xffffFFFF << (32 - prefix)) & 0xffffFFFF)
+    t1 = {} # one-level trie
+    for n in net:
+        trie = (int(n.network_address) >> discard) & trie_mask
+        if trie not in t1:
+            t1[trie] = []
+        t1[trie].append(n)
+    return t1, trie_mask
+
+def write_lua_table_with_f(out, name, table):
+    # Allocate the first chunk in-place to avoid realloc() of small table? May it save some RAM?
+    # Seems, it actually makes things worse. Maybe something is not GCed...
+    out.write('local {name:s} = {{}}\n'.format(name=name))
+    for start in range(0, len(table), LUA_CHUNK):
+        out.write('f = function (t)\n')
+        out.write('local x = true;\n') # to make lua file ~24% smaller.
+        for token in table[start:start+LUA_CHUNK]:
+            out.write('t[{}]=x\n'.format(token))
+        out.write('end\n')
+        out.write('f({name:s})\n'.format(name=name))
+
+def main():
+    src = sys.argv[1:]
+    dst = src.pop()
+    if os.path.exists(dst):
+        raise RuntimeError('Destination should not exist', dst)
+    src = prune_src(src)
+    ip4, net4, ip6, net6 = parse_src(src)
+
+    # int32 instead of IPv4 address string saves ~34 bytes of RAM per IP.
+    # int32 hex encoding instead of base-10 int shrinks lua.gz by ~4%.
+    ip4 = sorted(int(IPv4Address(_)) for _ in ip4)
+    ip4 = ['0x{:x}'.format(_) for _ in ip4]
+    net4, net4_mask = make_32bit_trie(net4, IPv4Network)
+
+    ip6 = sorted(int(IPv6Address(_)) for _ in ip6)
+    ip6 = ['"{}"'.format(''.join('\\{:d}'.format(b) for b in _.to_bytes(16, 'big'))) for _ in ip6]
+    net6, net6_mask = make_32bit_trie(net6, IPv6Network)
+
+    destdir = os.path.dirname(dst)
+    with tempfile.NamedTemporaryFile('w', dir=destdir) as out:
+        out.write('-- This is a generated file. DO NOT EDIT! It is data for kabysdoh DoH policy.\n')
+        out.write('local f = nil;\n')
+        write_lua_table_with_f(out, 'ip', ip4)
+        write_lua_table_with_f(out, 'ipv6', ip6)
+        out.write('f = nil\n')
+
+        # It's 6 lists with /19 mask as of 20201227 ⇒ only ~0.001% of IPs hit the list test.
+        out.write('local ipSubnetTrieMask = 0x{:x};\n'.format(net4_mask))
+        out.write('local ipSubnet = {\n')
+        for trie in sorted(net4):
+            out.write('[0x{:x}] = {{\n'.format(trie))
+            for n in net4[trie]:
+                out.write(' {{ 0x{:x}, 0x{:x} }},\n'.format(int(n.network_address), int(n.netmask)))
+            out.write('},\n')
+        out.write('};\n')
+
+        out.write('local ipv6SubnetTrieMask = 0x{:x};\n'.format(net6_mask))
+        out.write('local ipv6Subnet = {\n')
+        for trie in sorted(net6):
+            out.write('[0x{:x}] = {{\n'.format(trie))
+            for n in net6[trie]:
+                out.write(' {{ "{:s}", {:d} }},\n'.format(str(n.network_address), n.prefixlen))
+            out.write('},\n')
+        out.write('};\n')
+
+        # out.write('collectgarbage("collect")\n')
+        # out.write('print(collectgarbage("count"))\n')
+        out.write('return {{ {} }};\n'.format(', '.join('{} = {}'.format(_, _) for _ in (
+            'ip', 'ipSubnet', 'ipSubnetTrieMask', 'ipv6', 'ipv6Subnet', 'ipv6SubnetTrieMask',
+        ))))
+        out.write('-- EOF')
+
+        out.flush()
+        os.link(out.name, dst)
+
+if __name__ == '__main__':
+    main()

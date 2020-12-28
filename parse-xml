@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+
+from ipaddress import IPv4Network, IPv4Address, IPv6Network, IPv6Address
+from hashlib import sha1
+import gzip
+import json
+import os
+import sys
+import tempfile
+import time
+import xml.etree.cElementTree as ET
+
+RKN_EPOCH = 1343462400 # Sat Jul 28 12:00:00 MSK 2012
+JSONZ_SUFFIX = '.kabysdoh.json'
+GZIP_LEVEL = 3 # {1,2,3} have ~same speed, 4 is 40% slower.
+
+def parse_xml(file):
+    # `file` might be both file path and fileobj.
+    ctx = ET.iterparse(file, events=('start', 'end')) # FIXME(pylint3): Using deprecated method iterparse().
+    _, root = next(ctx) # get the root element
+
+    ip4, net4 = set(), set()
+    ip6, net6 = set(), set()
+    for event, el in ctx:
+        if event == 'end' and el.tag == 'content':
+            # TODO: account for blockType
+            # if el.attrib.get('blockType') == 'ip':
+            for child in el:
+                if child.tag == 'ip':
+                    ip4.add(child.text)
+                elif child.tag == 'ipSubnet':
+                    net4.add(child.text)
+                elif child.tag == 'ipv6':
+                    ip6.add(child.text)
+                elif child.tag == 'ipv6Subnet':
+                    net6.add(child.text)
+            root.clear() # mem clean-up
+
+    # Normalization is needed as the folowing are the real datapoints:
+    # <ipv6>2600:9000:2077:2000:0009:dfa0:31c0:93a1</ipv6>
+    # <ipv6Subnet ts="2018-11-08T17:00:00+03:00">2a02:4680:22::214/32</ipv6Subnet>
+
+    # TODO: aggregation of networks MIGHT be a good idea, but it's not needed right now
+    net4 = {IPv4Network(_, strict=False) for _ in net4}
+    net4 = sorted(net4)
+
+    # <ip> contained in <ipSubnet> is a usual thing.
+    ip4 = {IPv4Address(_) for _ in ip4}
+    ip4 = [_ for _ in ip4 if all(_ not in net for net in net4)]
+    ip4.sort()
+
+    net6 = {IPv6Network(_, strict=False) for _ in net6}
+    net6 = sorted(net6)
+
+    ip6 = {IPv6Address(_) for _ in ip6}
+    ip6 = [_ for _ in ip6 if all(_ not in net for net in net6)]
+    ip6.sort()
+
+    return ip4, net4, ip6, net6
+
+def make_blob(src):
+    with gzip.GzipFile(src) as fd:
+        ip4, net4, ip6, net6 = parse_xml(fd)
+        ip4 = [str(_) for _ in ip4]
+        net4 = [str(_) for _ in net4]
+        ip6 = [str(_) for _ in ip6]
+        net6 = [str(_) for _ in net6]
+        blob = json.dumps({
+            'ip': ip4,
+            'ipSubnet': net4,
+            'ipv6': ip6,
+            'ipv6Subnet': net6,
+        }, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return blob
+
+def main():
+    src, dst = sys.argv[1:]
+    if os.path.exists(dst):
+        raise RuntimeError('Already exists', dst)
+    blob = make_blob(src)
+    filename = sha1(blob).hexdigest().lower() + JSONZ_SUFFIX
+    destdir = os.path.dirname(dst)
+    with tempfile.NamedTemporaryFile(dir=destdir) as raw, \
+         gzip.GzipFile(fileobj=raw, mode='wb', compresslevel=GZIP_LEVEL, filename=filename, mtime=RKN_EPOCH) as out:
+        out.write(blob)
+        out.flush()
+        raw.flush()
+        os.link(raw.name, dst)
+    update_time = os.path.getmtime(src)
+    os.utime(dst, (time.time(), update_time))
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+
+import gzip
+import os
+import sys
+import tempfile
+import time
+
+import requests
+
+GZIP_LEVEL = 3 # {1,2,3} have ~same speed, 4 is 40% slower.
+
+def fetch(sess, giweb, xml_sha1, update_time, destdir):
+    destname = os.path.join(destdir, str(update_time))
+    if os.path.exists(destname):
+        return
+    stream = sess.get('{}/dump_xml/{}'.format(giweb, xml_sha1), stream=True)
+    stream.raise_for_status()
+    filename = '{}_{}.xml'.format(time.strftime('%FT%TZ', time.gmtime(update_time)), xml_sha1)
+    with tempfile.NamedTemporaryFile(dir=destdir) as raw, \
+         gzip.GzipFile(fileobj=raw, mode='wb', compresslevel=GZIP_LEVEL, filename=filename, mtime=update_time) as out:
+        for chunk in stream.iter_content(chunk_size=None):
+            out.write(chunk)
+        out.flush()
+        raw.flush()
+        os.link(raw.name, destname)
+    os.utime(destname, (time.time(), update_time))
+
+def main():
+    giweb, depth_seconds, destdir = sys.argv[1:]
+    depth_seconds = int(depth_seconds)
+    since = int(time.time() - depth_seconds)
+    os.makedirs(destdir, exist_ok=True)
+    with requests.Session() as sess:
+        backlog_url = '{}/since_update_time/{}/65536/update_time~xml_sha1'.format(giweb, since)
+        backlog_resp = sess.get(backlog_url)
+        backlog_resp.raise_for_status()
+        backlog = backlog_resp.json()['data']
+        if len(backlog) == 65536:
+            raise RuntimeError('Unable to process more than 65536 files at once')
+        for entry in backlog:
+            update_time, xml_sha1 = entry['update_time'], entry['xml_sha1']
+            fetch(sess, giweb, xml_sha1, update_time, destdir)
+
+if __name__ == '__main__':
+    main()
