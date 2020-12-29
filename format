@@ -4,6 +4,7 @@ from ipaddress import IPv4Network, IPv4Address, IPv6Network, IPv6Address
 import gzip
 import json
 import os
+import struct
 import sys
 import tempfile
 import time
@@ -70,6 +71,22 @@ def make_32bit_trie(net, IPxxNetwork):
         t1[trie].append(n)
     return t1, trie_mask
 
+# Lua's `bit` module returns i32 as a result of operation, but it tolerates ui32 input.
+# See http://bitop.luajit.org/semantics.html
+Int32 = struct.Struct('i')
+Uint32 = struct.Struct('I')
+
+def ui32_to_i32(i):
+    return Int32.unpack(Uint32.pack(i))[0]
+
+assert Int32.size == Uint32.size == 4 and ui32_to_i32(0xc169c000) == -0x3e964000
+
+def uint128_to_lua_string(i):
+    l = ['"']
+    l.extend('\\{:d}'.format(b) for b in i.to_bytes(16, 'big'))
+    l.append('"')
+    return ''.join(l)
+
 def write_lua_table_with_f(out, name, table):
     # Allocate the first chunk in-place to avoid realloc() of small table? May it save some RAM?
     # Seems, it actually makes things worse. Maybe something is not GCed...
@@ -97,7 +114,7 @@ def main():
     net4, net4_mask = make_32bit_trie(net4, IPv4Network)
 
     ip6 = sorted(int(IPv6Address(_)) for _ in ip6)
-    ip6 = ['"{}"'.format(''.join('\\{:d}'.format(b) for b in _.to_bytes(16, 'big'))) for _ in ip6]
+    ip6 = [uint128_to_lua_string(_) for _ in ip6]
     net6, net6_mask = make_32bit_trie(net6, IPv6Network)
 
     destdir = os.path.dirname(dst)
@@ -112,7 +129,7 @@ def main():
         out.write('local ipSubnetTrieMask = 0x{:x};\n'.format(net4_mask))
         out.write('local ipSubnet = {\n')
         for trie in sorted(net4):
-            out.write('[0x{:x}] = {{\n'.format(trie))
+            out.write('[{:#x}] = {{\n'.format(ui32_to_i32(trie)))
             for n in net4[trie]:
                 out.write(' {{ 0x{:x}, 0x{:x} }},\n'.format(int(n.network_address), int(n.netmask)))
             out.write('},\n')
@@ -121,9 +138,9 @@ def main():
         out.write('local ipv6SubnetTrieMask = 0x{:x};\n'.format(net6_mask))
         out.write('local ipv6Subnet = {\n')
         for trie in sorted(net6):
-            out.write('[0x{:x}] = {{\n'.format(trie))
+            out.write('[{:#x}] = {{\n'.format(ui32_to_i32(trie)))
             for n in net6[trie]:
-                out.write(' {{ "{:s}", {:d} }},\n'.format(str(n.network_address), n.prefixlen))
+                out.write(' {{ {:s}, {:d} }},\n'.format(uint128_to_lua_string(int(n.network_address)), n.prefixlen))
             out.write('},\n')
         out.write('};\n')
 

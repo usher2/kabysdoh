@@ -1,0 +1,2 @@
+#!/bin/sh
+exec kresd -c kresd.conf.lua -v
