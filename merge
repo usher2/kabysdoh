@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+
+import gzip
+import json
+import os
+import sys
+
+SHA1_HEXDIGEST_LEN = 40
+JSONZ_SUFFIX = '.kabysdoh.json'
+
+def parse_src(src):
+    ip4, net4 = set(), set()
+    ip6, net6 = set(), set()
+    for fname in src:
+        with gzip.open(fname, 'rt', encoding='utf-8') as fd:
+            doc = json.load(fd)
+            for src, dst in (
+                ('ip', ip4),
+                ('ipSubnet', net4),
+                ('ipv6', ip6),
+                ('ipv6Subnet', net6),
+            ):
+                for _ in doc[src]:
+                    dst.add(_)
+    # TODO: merge and/or split networks & re-filter ip sets with the merged set of networks
+    return ip4, net4, ip6, net6
+
+def prune_src(src):
+    # a 10-byte header: {\x1f\x8b\x08, 1:flags, 4:timestamp, 1:xflags, \xff} + {fname, \x00}
+    # a 8-byte trailer: CRC-32 checksum and the length of the original uncompressed data
+    magic = JSONZ_SUFFIX.encode('latin-1') + b'\x00'
+    known = set()
+    ret = []
+    for fname in src:
+        with open(fname, 'rb') as fd:
+            head = fd.read(10 + SHA1_HEXDIGEST_LEN + len(magic))
+            if head[-len(magic):] != magic:
+                raise RuntimeError('Unexpected magic', head[-len(magic):], magic)
+            if head not in known:
+                known.add(head)
+                ret.append(fname)
+    return ret
+
+def main():
+    src = sys.argv[1:]
+    src = prune_src(src)
+    ip4, net4, ip6, net6 = parse_src(src)
+    update_time = max(int(os.path.basename(_)) for _ in src)
+    json.dump({
+        'updateTime': update_time,
+        'ip': list(ip4),
+        'ipSubnet': list(net4),
+        'ipv6': list(ip6),
+        'ipv6Subnet': list(net6),
+    }, sys.stdout, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+if __name__ == '__main__':
+    main()

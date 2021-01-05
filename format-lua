@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 
 from ipaddress import IPv4Network, IPv4Address, IPv6Network, IPv6Address
-import gzip
 import json
 import os
 import struct
 import sys
 import tempfile
-import time
-import xml.etree.cElementTree as ET
 
-SHA1_HEXDIGEST_LEN = 40
-JSONZ_SUFFIX = '.kabysdoh.json'
 # Lua has a limit of 2^18 constants per function. See the following pages for details:
 # http://boston.conman.org/2009/11/09.2 & http://lua-users.org/lists/lua-l/2008-02/msg00257.html
 # This hack is needed as a workaround for "lua: constant table overflow" error for 170k v4 + 97k v6.
@@ -20,40 +15,7 @@ JSONZ_SUFFIX = '.kabysdoh.json'
 #   lua: dat.lua:199591: main function has more than 200 local variables
 LUA_CHUNK = 2 ** 16
 
-def parse_src(src):
-    ip4, net4 = set(), set()
-    ip6, net6 = set(), set()
-    for fname in src:
-        with gzip.open(fname, 'rt', encoding='utf-8') as fd:
-            doc = json.load(fd)
-            for src, dst in (
-                ('ip', ip4),
-                ('ipSubnet', net4),
-                ('ipv6', ip6),
-                ('ipv6Subnet', net6),
-            ):
-                for _ in doc[src]:
-                    dst.add(_)
-    return ip4, net4, ip6, net6
-
-def prune_src(src):
-    # a 10-byte header: {\x1f\x8b\x08, 1:flags, 4:timestamp, 1:xflags, \xff} + {fname, \x00}
-    # a 8-byte trailer: CRC-32 checksum and the length of the original uncompressed data
-    magic = JSONZ_SUFFIX.encode('latin-1') + b'\x00'
-    known = set()
-    ret = []
-    for fname in src:
-        with open(fname, 'rb') as fd:
-            head = fd.read(10 + SHA1_HEXDIGEST_LEN + len(magic))
-            if head[-len(magic):] != magic:
-                raise RuntimeError('Unexpected magic', head[-len(magic):], magic)
-            if head not in known:
-                known.add(head)
-                ret.append(fname)
-    return ret
-
 def make_32bit_trie(net, IPxxNetwork):
-    assert isinstance(net, set)
     default = {
         IPv4Network: '0.0.0.0/32',
         IPv6Network: '::/32', # The minimum [RIPE] allocation size for IPv6 address space is /32.
@@ -100,12 +62,11 @@ def write_lua_table_with_f(out, name, table):
         out.write('f({name:s})\n'.format(name=name))
 
 def main():
-    src = sys.argv[1:]
-    dst = src.pop()
+    dst, = sys.argv[1:]
     if os.path.exists(dst):
         raise RuntimeError('Destination should not exist', dst)
-    src = prune_src(src)
-    ip4, net4, ip6, net6 = parse_src(src)
+    doc = json.load(sys.stdin)
+    ip4, net4, ip6, net6 = doc['ip'], doc['ipSubnet'], doc['ipv6'], doc['ipv6Subnet']
 
     # int32 instead of IPv4 address string saves ~34 bytes of RAM per IP.
     # int32 hex encoding instead of base-10 int shrinks lua.gz by ~4%.
