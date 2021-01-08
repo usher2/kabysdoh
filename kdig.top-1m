@@ -1,0 +1,11 @@
+#!/bin/sh
+
+kdig_args="@127.0.0.1 +retry=0 +timeout=10"
+
+if [ $# -eq 0 ]; then
+    kdig IN SOA ${kdig_args} . || exit 1
+    head -n 1000 top-1m.csv | shuf | sed 's/^[0-9]\+,//; p; s/^/www./' | xargs -P 64 -L 100 "$0"
+else
+    kdig IN A ${kdig_args} +nomultiline +noheader +nocomments +noquestion +nostats "$@" >top-1m.A.$$
+    exec kdig IN AAAA ${kdig_args} +nomultiline +noheader +nocomments +noquestion +nostats "$@" >top-1m.AAAA.$$
+fi

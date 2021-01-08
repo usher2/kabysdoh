@@ -1,0 +1,3 @@
+#!/bin/sh -ex
+/usr/lib/unbound/package-helper root_trust_anchor_update
+exec /usr/sbin/unbound -vvvv -d -p -c /mnt/unbound.conf

@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+
+from ipaddress import IPv4Network, IPv4Address, IPv6Network, IPv6Address
+import json
+import os
+import sys
+import tempfile
+
+def main():
+    dst, = sys.argv[1:]
+    if os.path.exists(dst):
+        raise RuntimeError('Destination should not exist', dst)
+    d = json.load(sys.stdin)
+
+    d['uint128'] = 2 ** 128 - 1
+    d['ip'] = sorted(int(IPv4Address(_)) for _ in d['ip'])
+    d['ipv6'] = sorted(int(IPv6Address(_)) for _ in d['ipv6'])
+    d['ipSubnet'] = sorted(
+        (int(n.network_address), int(n.netmask))
+        for n in (IPv4Network(s) for s in d['ipSubnet'])
+    )
+    d['ipv6Subnet'] = sorted(
+        (int(n.network_address), int(n.netmask))
+        for n in (IPv6Network(s) for s in d['ipv6Subnet'])
+    )
+    d['cdnSubnet'] = sorted(
+        (int(n.network_address), int(n.netmask), cdn)
+        for n, cdn in ((IPv4Network(s), cdn) for s, cdn in d['cdnSubnet'])
+    )
+    d['cdnv6Subnet'] = sorted(
+        (int(n.network_address), int(n.netmask), cdn)
+        for n, cdn in ((IPv6Network(s), cdn) for s, cdn in d['cdnv6Subnet'])
+    )
+
+    destdir = os.path.dirname(dst)
+    with tempfile.NamedTemporaryFile('w', dir=destdir) as out:
+        json.dump(d, out, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        out.flush()
+        os.link(out.name, dst)
+
+if __name__ == '__main__':
+    main()

@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 
+from ipaddress import ip_network, ip_address
 import gzip
 import json
 import os
+import socket
 import sys
 
 SHA1_HEXDIGEST_LEN = 40
+GZIP_MAGIC = b'\x1f\x8b\x08'
 JSONZ_SUFFIX = '.kabysdoh.json'
 
-def parse_src(src):
+def parse_rkn(rkn):
     ip4, net4 = set(), set()
     ip6, net6 = set(), set()
-    for fname in src:
+    for fname in rkn:
         with gzip.open(fname, 'rt', encoding='utf-8') as fd:
             doc = json.load(fd)
             for src, dst in (
@@ -25,33 +28,99 @@ def parse_src(src):
     # TODO: merge and/or split networks & re-filter ip sets with the merged set of networks
     return ip4, net4, ip6, net6
 
-def prune_src(src):
+def prune_rkn(rkn):
     # a 10-byte header: {\x1f\x8b\x08, 1:flags, 4:timestamp, 1:xflags, \xff} + {fname, \x00}
     # a 8-byte trailer: CRC-32 checksum and the length of the original uncompressed data
     magic = JSONZ_SUFFIX.encode('latin-1') + b'\x00'
     known = set()
     ret = []
-    for fname in src:
+    for fname in rkn:
         with open(fname, 'rb') as fd:
             head = fd.read(10 + SHA1_HEXDIGEST_LEN + len(magic))
-            if head[-len(magic):] != magic:
+            if head[:3] != GZIP_MAGIC or head[-len(magic):] != magic:
                 raise RuntimeError('Unexpected magic', head[-len(magic):], magic)
             if head not in known:
                 known.add(head)
                 ret.append(fname)
     return ret
 
+def rkn_or_cdn(files):
+    rkn, cdn = [], []
+    for fname in files:
+        with open(fname, 'rb') as fd:
+            dst = rkn if fd.read(3) == GZIP_MAGIC else cdn
+        dst.append(fname)
+    return rkn, cdn
+
+def parse_cdn(cdn):
+    cdn4, cdn6 = [], []
+    for fname in cdn:
+        name = os.path.basename(fname)
+        with open(fname) as fd:
+            net = [ip_network(_.strip()) for _ in fd.readlines()]
+        net4 = [n for n in net if n.version == 4]
+        net6 = [n for n in net if n.version == 6]
+        assert all(not c.overlaps(n) for c in cdn4 for n in net4)
+        assert all(not c.overlaps(n) for c in cdn6 for n in net6)
+        cdn4.extend((str(n), name) for n in net4)
+        cdn6.extend((str(n), name) for n in net6)
+    return cdn4, cdn6
+
+def is_in_cdn(domain, net, name):
+    for af in socket.AF_INET, socket.AF_INET6:
+        try:
+            addrinfo = socket.getaddrinfo(domain, 443, af, socket.SOCK_STREAM)
+        except socket.gaierror as err:
+            print('{:s} is not dual-stack, AF:{:d} fails with {:s}'.format(domain, af, str(err)), file=sys.stderr)
+            return False
+        for (_, _, _, _, sockaddr) in addrinfo:
+            ip = ip_address(sockaddr[0]) # IPv4 is IP:Port, but IPv6 is IP:Port:Something:More
+            if not any(ip in n for n in net):
+                print('{:s} ({:s}) is not in expected CDN ({:s})'.format(domain, ip, name), file=sys.stderr)
+                return False
+    return True
+
+def verify_domains(cdn4, cdn6):
+    # www or not-www? Just take the "default" webpage domain.
+    cdnDomains = {
+        'cloudflare': [
+            'medium.com.',
+            'www.udemy.com.',
+            'pixabay.com.',
+            'www.pexels.com.',
+            'discord.com.',
+            'www.worldometers.info.',
+            'www.glassdoor.com.',
+            'www.patreon.com.',
+            'www.sciencedirect.com.',
+            'www.webmd.com.',
+        ],
+    }
+    known_names = {name for _, name in cdn4 + cdn6}
+    assert all(name in cdnDomains for name in known_names)
+    for name in known_names:
+        net = [ip_network(n) for n, _ in cdn4 + cdn6 if _ == name]
+        cdnDomains[name] = [d for d in cdnDomains[name] if is_in_cdn(d, net, name)]
+        # empty cdnDomains is not fatal as DNS server may learn new CDN domains in runtime.
+    return cdnDomains
+
 def main():
-    src = sys.argv[1:]
-    src = prune_src(src)
-    ip4, net4, ip6, net6 = parse_src(src)
-    update_time = max(int(os.path.basename(_)) for _ in src)
+    rkn, cdn = rkn_or_cdn(sys.argv[1:])
+    rkn = prune_rkn(rkn)
+    ip4, net4, ip6, net6 = parse_rkn(rkn)
+    update_time = max(int(os.path.basename(_)) for _ in rkn)
+    cdn4, cdn6 = parse_cdn(cdn)
+    cdnDomains = verify_domains(cdn4, cdn6)
     json.dump({
         'updateTime': update_time,
         'ip': list(ip4),
         'ipSubnet': list(net4),
         'ipv6': list(ip6),
         'ipv6Subnet': list(net6),
+        'cdnSubnet': cdn4,
+        'cdnv6Subnet': cdn6,
+        # Subset of suitable domains cherry-picked from Alexa top 500.
+        'cdnDomains': cdnDomains,
     }, sys.stdout, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
 
 if __name__ == '__main__':

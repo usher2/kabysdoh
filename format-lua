@@ -67,6 +67,7 @@ def main():
         raise RuntimeError('Destination should not exist', dst)
     doc = json.load(sys.stdin)
     ip4, net4, ip6, net6 = doc['ip'], doc['ipSubnet'], doc['ipv6'], doc['ipv6Subnet']
+    # TODO: parse doc['cdnSubnet'] and doc['cdnv6Subnet']
 
     # int32 instead of IPv4 address string saves ~34 bytes of RAM per IP.
     # int32 hex encoding instead of base-10 int shrinks lua.gz by ~4%.

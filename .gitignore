@@ -1,0 +1,14 @@
+# see kdig.top-1m
+top-1m.A.[1-9]*
+top-1m.AAAA.[1-9]*
+
+# see Makefile
+cf-ips-v4
+cf-ips-v6
+cloudflare
+js/[1-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]
+xml/[1-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]
+dump.lua
+dump.pyjson
+top-1m.csv.zip
+top-1m.csv

@@ -14,6 +14,22 @@ RKN_EPOCH = 1343462400 # Sat Jul 28 12:00:00 MSK 2012
 JSONZ_SUFFIX = '.kabysdoh.json'
 GZIP_LEVEL = 3 # {1,2,3} have ~same speed, 4 is 40% slower.
 
+# Parsing of dump.xml is tricky. E.g. what does ipSubnet mean for blockType="domain"?
+#
+# <content id="114111" includeTime="2014-11-12T22:04:31" entryType="1" blockType="domain" hash="D993259AF65653E2E7EAFA613DAFCB0E">
+#   <decision date="2014-11-05" number="2/1/11-28574" org="ФСКН"/>
+#   <domain><![CDATA[legalrc.biz]]></domain>
+#   <ip>193.105.213.21</ip>
+#   <ip>193.105.213.25</ip>
+#   <ip>193.105.213.26</ip>
+#   <ip>193.105.213.29</ip>
+#   <ip>193.105.213.241</ip>
+#   <ip>193.105.213.35</ip>
+#   <ip>193.105.213.27</ip>
+#   <ip>193.105.213.40</ip>
+#   <ipSubnet>193.105.213.36/30</ipSubnet>
+# </content>
+
 def parse_xml(file):
     # `file` might be both file path and fileobj.
     ctx = ET.iterparse(file, events=('start', 'end')) # FIXME(pylint3): Using deprecated method iterparse().
@@ -23,17 +39,31 @@ def parse_xml(file):
     ip6, net6 = set(), set()
     for event, el in ctx:
         if event == 'end' and el.tag == 'content':
-            # TODO: account for blockType
-            # if el.attrib.get('blockType') == 'ip':
-            for child in el:
-                if child.tag == 'ip':
-                    ip4.add(child.text)
-                elif child.tag == 'ipSubnet':
-                    net4.add(child.text)
-                elif child.tag == 'ipv6':
-                    ip6.add(child.text)
-                elif child.tag == 'ipv6Subnet':
-                    net6.add(child.text)
+            blockType = el.attrib.get('blockType') # 'domain', 'domain-mask', 'ip' and None
+            if blockType in ('domain', 'domain-mask'):
+                isIp = False
+            elif blockType == 'ip':
+                isIp = True
+            else:
+                # default blockType handling is a bit heuristical
+                if blockType is not None:
+                    print('Unknown <content blockType="{:s}">'.format(blockType), file=sys.stderr)
+                for child in el:
+                    if child.tag in ('url', 'domain'):
+                        isIp = False # that's _usually_ passed through DPI and <ip/> is ignored
+                        break
+                else:
+                    isIp = True
+            if isIp:
+                for child in el:
+                    if child.tag == 'ip':
+                        ip4.add(child.text)
+                    elif child.tag == 'ipSubnet':
+                        net4.add(child.text)
+                    elif child.tag == 'ipv6':
+                        ip6.add(child.text)
+                    elif child.tag == 'ipv6Subnet':
+                        net6.add(child.text)
             root.clear() # mem clean-up
 
     # Normalization is needed as the folowing are the real datapoints:
@@ -65,6 +95,7 @@ def make_blob(src):
         net4 = [str(_) for _ in net4]
         ip6 = [str(_) for _ in ip6]
         net6 = [str(_) for _ in net6]
+        # NB: `blob` must have consistent content hash, e.g. there should be no timestamps.
         blob = json.dumps({
             'ip': ip4,
             'ipSubnet': net4,
