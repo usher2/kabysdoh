@@ -225,6 +225,33 @@ def set_crafted_return_msg(qstate, unwanted, stash=None):
 
     return True
 
+def launch_subquery(qstate, qname, qtype):
+    attach_sub = qstate.env.attach_sub
+    if attach_sub is None:
+        # NULL pointer here is not lack of memory, it looks like logic error
+        raise RuntimeError('qstate.env.attach_sub is None')
+
+    # Oh the roskomnadzor is frightful!
+    # And the SWIG is not so delightful. :-(
+    # Since we've no way to __call__()...
+    # Let it blow! Let it blow! Let it blow!
+    attach_sub = ATTACH_SUB_T(int(attach_sub)) # `attach_sub` is a pointer, not a SWIG-wrapped function.
+
+    qi = query_info() # SWIG proxy is used as sizeof(query_info) _might_ change across versions.
+    qiwr = ctypes.cast(int(qi.this), query_info_head_p)[0] # query_info is %immutable
+    qiwr.qname = qname
+    qiwr.qname_len = len(qname)
+    qiwr.qclass = RR_CLASS_IN
+    qiwr.qtype = qtype
+
+    newq = ctypes.c_void_p()
+
+    if not attach_sub(int(qstate.this), qiwr, qstate.query_flags, qstate.is_priming, qstate.is_valrec, ctypes.pointer(newq)):
+        log_info('attach_sub failed')
+        return False
+
+    return True
+
 """
 MODULE_STATE_INITIAL initial state - new query
 MODULE_WAIT_REPLY    waiting for reply to outgoing network query. It's for `iterator' module.
@@ -339,33 +366,13 @@ def operate(id, event, qstate, qdata):
         else:
             # TODO: is invalidateQueryInCache needed here before sub-query?
             log_info('****** TODO: REWRITE IT, rrcdn:{} good:{} unwanted:{}'.format(rrcdn, good, unwanted))
-            attach_sub = qstate.env.attach_sub
-            if attach_sub is None:
-                log_info('WAT: attach_sub() is None')
-                qstate.ext_state[id] = MODULE_ERROR
-                return True
-            # Oh the roskomnadzor is frightful!
-            # And the SWIG is not so delightful. :-(
-            # Since we've no way to __call__()...
-            # Let it blow! Let it blow! Let it blow!
-            attach_sub = ATTACH_SUB_T(int(attach_sub)) # `attach_sub` is a pointer, not a SWIG-wrapped function.
 
-            sqi = query_info() # SWIG proxy is used as sizeof(query_info) _might_ change across versions.
-            sqiwr = ctypes.cast(int(sqi.this), query_info_head_p)[0] # query_info is %immutable
             sqname = b'\x03www\x0acloudflare\x03com\x00' # TODO: cdnDomains[rrcdn]
-            sqiwr.qname = sqname
-            sqiwr.qname_len = len(sqname)
-            sqiwr.qclass = qclass
-            sqiwr.qtype = qtype
 
-            newq = ctypes.c_void_p()
-
-            if not attach_sub(int(qstate.this), sqiwr, qstate.query_flags, qstate.is_priming, qstate.is_valrec, ctypes.pointer(newq)):
-                log_info('WAT: attach_sub() failed')
+            if launch_subquery(qstate, sqname, qtype):
+                qstate.ext_state[id] = MODULE_WAIT_SUBQUERY
+            else:
                 qstate.ext_state[id] = MODULE_ERROR
-                return True
-
-            qstate.ext_state[id] = MODULE_WAIT_SUBQUERY
             return True
     else:
         log_info('****** TODO: BLOCKPAGE SERVER, good:{} unwanted:{}'.format(good, unwanted))
