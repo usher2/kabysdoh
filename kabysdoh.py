@@ -3,6 +3,7 @@
 import ctypes
 import json
 import random
+import threading
 import time
 
 DUMP_PATH = '/mnt/dump.pyjson'
@@ -33,6 +34,8 @@ c_void_pp = ctypes.POINTER(ctypes.c_void_p)
 # int (*attach_sub)(struct module_qstate* qstate, struct query_info* qinfo, uint16_t qflags, int prime, int valrec, struct module_qstate** newq);
 ATTACH_SUB_T = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, query_info_head_p, ctypes.c_uint16, ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
 
+LOCK = object()
+
 def load_dump(fpath):
     # It takes ~150 ms to load & parse the dump dated 2020-12-26.
     with open(fpath, 'rt') as fd:
@@ -53,7 +56,7 @@ def load_dump(fpath):
                 t1[netaddr] = None
         d['{}TrieMask'.format(setname)] = common_mask
         d[setname] = t1
-    d['cdn'], d['cdnv6'] = {}, {}
+    d['cdn'], d['cdnv6'] = {LOCK: threading.Lock()}, {LOCK: threading.Lock()}
     for (nbits, setname) in ((32, 'cdnSubnet'), (128, 'cdnv6Subnet')):
         common_mask = 2 ** nbits - 1
         for (_, netmask, _) in d[setname]:
@@ -124,7 +127,7 @@ def parse_reply_info(rep):
                 ip = int.from_bytes(blob[2:], 'big')
 
                 netlist = t1.get(ip & common_mask, False)
-                if ip in d['ip'] or (
+                if ip in ipset or (
                     netlist is not False and (
                         netlist is None # netmask == common_mask
                         or any((ip & netmask) == netaddr for netaddr, netmask in netlist)
@@ -268,45 +271,40 @@ MODULE_FINISHED      module is finished with query. The query is done & finished
 #   MODULE_EVENT_CAPSFAIL reply is there, but capitalisation check failed
 # And this one is a generic error:
 #   MODULE_EVENT_ERROR    error
+
+SUBQUERY, STASH_QTYPE, UNWANTED, RRCDN = object(), object(), object(), object()
+
 def operate(id, event, qstate, qdata):
-    # qstate.reply is None in all the cases I've tested. It makes sense in presence of mesh_info.
-    is_external = qstate.mesh_info.reply_list is not None # reply_list.query_reply.addr points to client
-    has_reply = qstate.return_msg is not None
-
-    log_query_info(NO_VERBOSE, 'operate(): event:{} qdata:{} has_reply:{} is_external:{} qinfo:'.format(
-        strmodulevent(event), qdata, has_reply, is_external), qstate.qinfo)
-
-    qdata['i'] = qdata.get('i', 0) + 1
-    if qdata['i'] > 32:
-        log_query_info(NO_VERBOSE, 'too deep operate(): event:{} qdata:{} has_reply:{} is_external:{} qinfo:'.format(
-            strmodulevent(event), qdata, has_reply, is_external), qstate.qinfo)
-        qstate.ext_state[id] = MODULE_ERROR
-        return True
-
-    if event == MODULE_EVENT_NEW or event == MODULE_EVENT_PASS: # new query OR query passed by other module
-        if not has_reply:
-            qstate.ext_state[id] = MODULE_WAIT_MODULE
+    if event in (MODULE_EVENT_PASS, MODULE_EVENT_NEW): # query passed by other module OR new query
+        # MODULE_EVENT_PASS is either "new" query or module wake-up after sub-query.
+        # MODULE_EVENT_NEW does not happen if `subnetcache` is called before `python`.
+        # _If I understand Unbound state machine correctly._
+        if SUBQUERY not in qdata:
+            qstate.ext_state[id] = MODULE_WAIT_MODULE # down to validator & iterator
             return True
-        # else:
-        #     # We have a reply, we just don't like it :-) _Probably_ that's sub-query talking to us.
-        #     qstate.ext_state[id] = MODULE_FINISHED
-        #     return True
+        else:
+            return operate_on_subquery_results(id, qstate, qdata)
     elif event != MODULE_EVENT_MODDONE: # next module is done, and its reply is awaiting you
         qstate.ext_state[id] = MODULE_ERROR
         return True
 
-    # assert event == MODULE_EVENT_MODDONE (or fall-through from event == MODULE_EVENT_NEW or event == MODULE_EVENT_PASS)
+    assert SUBQUERY not in qdata
 
+    # qstate.reply is None in all the cases I've tested. It makes sense in presence of mesh_info.
+    is_external = qstate.mesh_info.reply_list is not None # reply_list.query_reply.addr points to client
+    has_reply = qstate.return_msg is not None
     qinfo = qstate.qinfo
     qtype, qclass = qinfo.qtype, qinfo.qclass
-    if not is_external or (qtype != RR_TYPE_A and qtype != RR_TYPE_AAAA) or qclass != RR_CLASS_IN:
+    # log_query_info(NO_VERBOSE, 'operate(): event:{} qdata:{} has_reply:{} is_external:{} qinfo:'.format(
+    #     strmodulevent(event), qdata, has_reply, is_external), qinfo)
+    if not is_external or qtype not in (RR_TYPE_A, RR_TYPE_AAAA) or qclass != RR_CLASS_IN:
         # These are not the queries you are looking for.
         qstate.ext_state[id] = MODULE_FINISHED
         return True
 
     if not has_reply: # how is MODULE_EVENT_MODDONE possible without return_msg?!
         log_query_info(NO_VERBOSE, 'WAT?! operate(): event:{} qdata:{} has_reply:{} is_external:{} qinfo:'.format(
-            strmodulevent(event), qdata, has_reply, is_external), qstate.qinfo)
+            strmodulevent(event), qdata, has_reply, is_external), qinfo)
         qstate.ext_state[id] = MODULE_FINISHED
         return True
 
@@ -325,13 +323,10 @@ def operate(id, event, qstate, qdata):
     good, unwanted, rrcdn, _ = parse_reply_info(rep)
     if len(rrcdn) == 1:
         rrcdn = rrcdn.pop()
-    elif len(rrcdn) > 1:
-        log_info('ambiguous CDN for {}: {}'.format(qinfo.qname_str, rrcdn))
-        rrcdn = None
     else:
+        if len(rrcdn) > 1:
+            log_info('ambiguous CDN for {}: {}'.format(qinfo.qname_str, rrcdn))
         rrcdn = None
-
-    d = DUMP
 
     if not unwanted: # all is good
         pass
@@ -342,41 +337,39 @@ def operate(id, event, qstate, qdata):
     elif rrcdn is not None:
         unwanted_rr_len = {len(blob) for blob in unwanted}
         if len(unwanted_rr_len) > 1:
-            # TODO: technically, it's possible to handle that
-            log_info('WAT: non-trivial unwanted_rr_len: {}'.format(unwanted_rr_len))
-            qstate.ext_state[id] = MODULE_ERROR
-            return True
-        unwanted_rr_len = unwanted_rr_len.pop()
-        if unwanted_rr_len == 6:
-            stash, stash_qtype = d['cdn'], RR_TYPE_A
-        elif unwanted_rr_len == 18:
-            stash, stash_qtype = d['cdnv6'], RR_TYPE_AAAA
-        else:
-            log_info('WAT: bad unwanted_rr_len: {}'.format(unwanted_rr_len))
-            qstate.ext_state[id] = MODULE_ERROR
-            return True
-        now = time.monotonic()
-        stash[rrcdn] = stash = [(exp, rr) for exp, rr in stash[rrcdn] if now < exp] # TODO: lock?
-        if stash:
-            stash = stash[:]
-            random.shuffle(stash)
-            if not set_crafted_return_msg(qstate, unwanted, stash):
-                qstate.ext_state[id] = MODULE_ERROR
-                return True
-        else:
-            # TODO: is invalidateQueryInCache needed here before sub-query?
-            log_info('****** TODO: REWRITE IT, rrcdn:{} good:{} unwanted:{}'.format(rrcdn, good, unwanted))
-
-            sqname = b'\x03www\x0acloudflare\x03com\x00' # TODO: cdnDomains[rrcdn]
-
-            if launch_subquery(qstate, sqname, qtype):
-                qstate.ext_state[id] = MODULE_WAIT_SUBQUERY
-            else:
-                qstate.ext_state[id] = MODULE_ERROR
-            return True
+            raise RuntimeError('Mixture of unwanted RR types in answer', unwanted)
+        qdata[SUBQUERY] = 0
+        qdata[STASH_QTYPE] = {6: RR_TYPE_A, 18: RR_TYPE_AAAA}[unwanted_rr_len.pop()]
+        qdata[UNWANTED] = unwanted
+        qdata[RRCDN] = rrcdn
+        return operate_on_subquery_results(id, qstate, qdata)
     else:
         log_info('****** TODO: BLOCKPAGE SERVER, good:{} unwanted:{}'.format(good, unwanted))
     qstate.ext_state[id] = MODULE_FINISHED
+    return True
+
+def operate_on_subquery_results(id, qstate, qdata):
+    d = DUMP
+    stashgrp = d['cdn' if qdata[STASH_QTYPE] == RR_TYPE_A else 'cdnv6']
+    now = time.monotonic()
+    with stashgrp[LOCK]: # it may be per-CDN, but it does not make sense with just ~two CDNs
+        stash = stashgrp[qdata[RRCDN]]
+        while stash and stash[-1][0] < now: # drop expired
+            stash.pop()
+        stash = stash.copy()
+    if stash:
+        random.shuffle(stash)
+        if set_crafted_return_msg(qstate, qdata[UNWANTED], stash):
+            qstate.ext_state[id] = MODULE_FINISHED
+        else:
+            qstate.ext_state[id] = MODULE_ERROR
+    else:
+        # TODO: is invalidateQueryInCache needed here before sub-query?
+        sqname = b'\x03www\x0acloudflare\x03com\x00' # TODO: cdnDomains[rrcdn]
+        if launch_subquery(qstate, sqname, qdata[STASH_QTYPE]):
+            qstate.ext_state[id] = MODULE_WAIT_SUBQUERY
+        else:
+            qstate.ext_state[id] = MODULE_ERROR
     return True
 
 def inform_super(module_id, qstate, superq, qdata):
@@ -391,20 +384,28 @@ def inform_super(module_id, qstate, superq, qdata):
     # What is the goal of inform_super() in python? How should it be used to modify superq state?...
 
     # qstate.env.{now,now_tv} point to gettimeogday() structures without wrappers. ctypes once more?
-    rep = qstate.return_msg.rep # `rep` for `reply`, struct reply_info
     d = DUMP
-    _, _, _, good = parse_reply_info(rep)
-    if not good:
+    _, _, _, good = parse_reply_info(qstate.return_msg.rep)
+    g4 = [_ for _ in good if _[2] == 6]
+    g6 = [_ for _ in good if _[2] == 18]
+    if not g4 and not g6:
         log_query_info(NO_VERBOSE, 'NO GOOD?! WTF?! inform_super(): qdata:{} qstate.qinfo:'.format(qdata), qstate.qinfo)
+        return True
     now = time.monotonic()
-    known = {}
-    for exp, rrtxt, rr_len, cdn in good:
-        # locks... concurrency, concurrent updates...
-        stash = d[{6: 'cdn', 18: 'cdnv6'}[rr_len]][cdn]
-        stash.append((exp, rrtxt))
-        known[id(stash)] = stash
-    for l in known.values():
-        l.sort(reverse=True)
-        while l and l[-1][0] < now:
-            l.pop()
+    for key, good in (('cdn', g4), ('cdnv6', g6)):
+        if not good:
+            continue
+        stashgrp = d[key]
+        with stashgrp[LOCK]:
+            known = {}
+            for exp, rrtxt, rr_len, cdn in good:
+                stash = stashgrp[cdn]
+                stash.append((exp, rrtxt))
+                known[id(stash)] = stash
+            for stash in known.values():
+                stash.sort(reverse=True)
+                while stash and stash[-1][0] < now: # drop expired
+                    stash.pop()
+                while len(stash) > 42: # prevent unbounded growth
+                    stash.pop()
     return True
