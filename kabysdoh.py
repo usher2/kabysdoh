@@ -90,6 +90,70 @@ def init_standard(id, env):
 def deinit(id):
     DUMP = None
 
+def parse_reply_info(rep):
+    d = DUMP
+    # rep points to `struct reply_info`
+    good, unwanted, rrcdn, goodcdn = 0, set(), set(), []
+
+    now = time.monotonic()
+    rrconf = {
+        NET_TYPE_A: (
+            6, d['ip'],
+            d['ipSubnet'], d['ipSubnetTrieMask'],
+            d['cdnSubnet'], d['cdnSubnetTrieMask'],
+        ),
+        NET_TYPE_AAAA: (
+            18, d['ipv6'],
+            d['ipv6Subnet'], d['ipv6SubnetTrieMask'],
+            d['cdnv6Subnet'], d['cdnv6SubnetTrieMask'],
+        )
+    }
+
+    for keyi in range(rep.an_numrrsets):
+        ub_packed_rrset_key = rep.rrsets[keyi] # struct ub_packed_rrset_key
+        rk = ub_packed_rrset_key.rk # struct packed_rrset_key
+        rk_conf = rrconf.get(rk.type)
+        if rk_conf is not None and rk.rrset_class == NET_CLASS_IN:
+            data = ub_packed_rrset_key.entry.data # struct packed_rrset_data
+            rr_len, ipset, t1, common_mask, cdnt1, cdn_mask = rk_conf
+            for rri in range(data.count):
+                blob = data.rr_data[rri]
+                if not (rr_len == data.rr_len[rri] == len(blob) == blob[1] + 2 and blob[0] == 0):
+                    continue # broken RR?! Other plugins do this check as well...
+                ip = int.from_bytes(blob[2:], 'big')
+
+                netlist = t1.get(ip & common_mask, False)
+                if ip in d['ip'] or (
+                    netlist is not False and (
+                        netlist is None # netmask == common_mask
+                        or any((ip & netmask) == netaddr for netaddr, netmask in netlist)
+                )):
+                    unwanted.add(blob)
+                    rr_good = False
+                else:
+                    good += 1
+                    rr_good = True
+
+                netlist = cdnt1.get(ip & cdn_mask, False)
+                if netlist is not False: # it _might_ be known CDN
+                    if isinstance(netlist, str): # netmask == common_mask
+                        cdn = netlist
+                    else:
+                        for netaddr, netmask, cdn in netlist:
+                            if (ip & netmask) == netaddr:
+                                break
+                        else:
+                            cdn = None
+                    if cdn is not None:
+                        rrcdn.add(cdn)
+                        if rr_good and data.rr_ttl[rri] > 0:
+                            exp = now + data.rr_ttl[rri]
+                            rrtxt = 'CLASS{:d} TYPE{:d} \\# {:d} {:s}'.format(
+                                ntohs(rk.rrset_class), ntohs(rk.type),
+                                blob[1],
+                                ''.join('{:02X}'.format(c) for c in blob[2:]))
+                            goodcdn.append((exp, rrtxt, rr_len, cdn))
+    return good, unwanted, rrcdn, goodcdn
 """
 MODULE_STATE_INITIAL initial state - new query
 MODULE_WAIT_REPLY    waiting for reply to outgoing network query. It's for `iterator' module.
@@ -160,49 +224,17 @@ def operate(id, event, qstate, qdata):
     # 3. TODO: learn domains for CDN'ed IP addresses if some IP addresses left for external queries.
     #    TODO: understand if malicious user may harm this heuristics and only sub-queries are good.
     #    Only external queries are considered as internal queries resolve A/AAAA for NSes and such.
+    good, unwanted, rrcdn, _ = parse_reply_info(rep)
+    if len(rrcdn) == 1:
+        rrcdn = rrcdn.pop()
+    elif len(rrcdn) > 1:
+        log_info('ambiguous CDN for {}: {}'.format(qinfo.qname_str, rrcdn))
+        rrcdn = None
+    else:
+        rrcdn = None
+
     d = DUMP
-    good, unwanted, rrcdn = 0, set(), None
-    for keyi in range(rep.an_numrrsets):
-        ub_packed_rrset_key = rep.rrsets[keyi] # struct ub_packed_rrset_key
-        rk = ub_packed_rrset_key.rk # struct packed_rrset_key
-        if (rk.type == NET_TYPE_A or rk.type == NET_TYPE_AAAA) and rk.rrset_class == NET_CLASS_IN:
-            data = ub_packed_rrset_key.entry.data # struct packed_rrset_data
-            if rk.type == NET_TYPE_A:
-                rr_len, ipset = 6, d['ip']
-                t1, common_mask = d['ipSubnet'], d['ipSubnetTrieMask']
-                cdnt1, cdn_mask = d['cdnSubnet'], d['cdnSubnetTrieMask']
-            else:
-                rr_len, ipset = 18, d['ipv6']
-                t1, common_mask = d['ipv6Subnet'], d['ipv6SubnetTrieMask']
-                cdnt1, cdn_mask = d['cdnv6Subnet'], d['cdnv6SubnetTrieMask']
-            for rri in range(data.count):
-                blob = data.rr_data[rri]
-                if data.rr_len[rri] != rr_len or len(blob) != rr_len or blob[0] != 0 or blob[1] != rr_len - 2:
-                    continue # broken RR?! Other plugins do this check as well...
-                ip = int.from_bytes(blob[2:], 'big')
-                netlist = t1.get(ip & common_mask, False)
-                if ip in d['ip'] or (
-                    netlist is not False and (
-                        netlist is None # netmask == common_mask
-                        or any((ip & netmask) == netaddr for netaddr, netmask in netlist)
-                )):
-                    unwanted.add(blob)
-                else:
-                    good += 1
-                netlist = cdnt1.get(ip & cdn_mask, False)
-                if netlist is not False: # it _might_ be known CDN
-                    if isinstance(netlist, str): # netmask == common_mask
-                        cdn = netlist
-                    else:
-                        for netaddr, netmask, cdn in netlist:
-                            if (ip & netmask) == netaddr:
-                                break
-                        else:
-                            cdn = None
-                    if cdn is not None:
-                        if rrcdn is not None and rrcdn != cdn:
-                            log_info('ambiguous CDN for {}: {} or {}'.format(rk.dname_str, cdn, rrcdn))
-                        rrcdn = cdn # the last one wins
+
     if not unwanted: # all is good
         pass
     elif good > 0: # just drop some RRs
@@ -298,6 +330,7 @@ def operate(id, event, qstate, qdata):
                 data = ub_packed_rrset_key.entry.data # struct packed_rrset_data
                 fitness[(rk.dname, rk.type, rk.rrset_class)] = data.trust, data.security
                 for rri in range(data.count):
+                    blob = data.rr_data[rri]
                     if not is_ip or blob not in unwanted:
                         # RFC3597 format
                         msg.answer.append('{:s} {:d} CLASS{:d} TYPE{:d} \\# {:d} {:s}'.format(
@@ -387,58 +420,10 @@ def inform_super(module_id, qstate, superq, qdata):
     # qstate.env.{now,now_tv} point to gettimeogday() structures without wrappers. ctypes once more?
     rep = qstate.return_msg.rep # `rep` for `reply`, struct reply_info
     d = DUMP
-    good = []
-    rrcdn = None
-    now = time.monotonic()
-    for keyi in range(rep.an_numrrsets):
-        ub_packed_rrset_key = rep.rrsets[keyi] # struct ub_packed_rrset_key
-        rk = ub_packed_rrset_key.rk # struct packed_rrset_key
-        if (rk.type == NET_TYPE_A or rk.type == NET_TYPE_AAAA) and rk.rrset_class == NET_CLASS_IN:
-            data = ub_packed_rrset_key.entry.data # struct packed_rrset_data
-            if rk.type == NET_TYPE_A:
-                rr_len, ipset = 6, d['ip']
-                t1, common_mask = d['ipSubnet'], d['ipSubnetTrieMask']
-                cdnt1, cdn_mask = d['cdnSubnet'], d['cdnSubnetTrieMask']
-            else:
-                rr_len, ipset = 18, d['ipv6']
-                t1, common_mask = d['ipv6Subnet'], d['ipv6SubnetTrieMask']
-                cdnt1, cdn_mask = d['cdnv6Subnet'], d['cdnv6SubnetTrieMask']
-            for rri in range(data.count):
-                blob = data.rr_data[rri]
-                if data.rr_len[rri] != rr_len or len(blob) != rr_len or blob[0] != 0 or blob[1] != rr_len - 2:
-                    continue # broken RR?! Other plugins do this check as well...
-                ip = int.from_bytes(blob[2:], 'big')
-                netlist = t1.get(ip & common_mask, False)
-                rrtxt = None
-                if ip in d['ip'] or (
-                    netlist is not False and (
-                        netlist is None # netmask == common_mask
-                        or any((ip & netmask) == netaddr for netaddr, netmask in netlist)
-                )):
-                    pass
-                elif data.rr_ttl[rri] > 0:
-                    exp = now + data.rr_ttl[rri]
-                    rrtxt = 'CLASS{:d} TYPE{:d} \\# {:d} {:s}'.format(
-                        ntohs(rk.rrset_class), ntohs(rk.type),
-                        data.rr_len[rri] - 2,
-                        ''.join('{:02X}'.format(c) for c in blob[2:]))
-                netlist = cdnt1.get(ip & cdn_mask, False)
-                if netlist is not False: # it _might_ be known CDN
-                    if isinstance(netlist, str): # netmask == common_mask
-                        cdn = netlist
-                    else:
-                        for netaddr, netmask, cdn in netlist:
-                            if (ip & netmask) == netaddr:
-                                break
-                        else:
-                            cdn = None
-                    if cdn is not None:
-                        if rrcdn is not None and rrcdn != cdn:
-                            log_info('ambiguous CDN for {}: {} or {}'.format(rk.dname_str, cdn, rrcdn))
-                        if rrtxt is not None:
-                            good.append((exp, rrtxt, rr_len, cdn))
+    _, _, _, good = parse_reply_info(rep)
     if not good:
         log_query_info(NO_VERBOSE, 'NO GOOD?! WTF?! inform_super(): qdata:{} qstate.qinfo:'.format(qdata), qstate.qinfo)
+    now = time.monotonic()
     known = {}
     for exp, rrtxt, rr_len, cdn in good:
         # locks... concurrency, concurrent updates...
