@@ -119,7 +119,8 @@ def parse_reply_info(rep):
             for rri in range(data.count):
                 blob = data.rr_data[rri]
                 if not (rr_len == data.rr_len[rri] == len(blob) == blob[1] + 2 and blob[0] == 0):
-                    continue # broken RR?! Other plugins do this check as well...
+                    # continue # broken RR?! Other plugins do this check as well...
+                    raise RuntimeError('RR with malformed rr_len', rk.dname_str)
                 ip = int.from_bytes(blob[2:], 'big')
 
                 netlist = t1.get(ip & common_mask, False)
@@ -154,6 +155,76 @@ def parse_reply_info(rep):
                                 ''.join('{:02X}'.format(c) for c in blob[2:]))
                             goodcdn.append((exp, rrtxt, rr_len, cdn))
     return good, unwanted, rrcdn, goodcdn
+
+def set_crafted_return_msg(qstate, unwanted, stash=None):
+    qinfo, rep = qstate.return_msg.qinfo, qstate.return_msg.rep # current `return_msg`
+
+    flags, security = rep.flags, rep.security # copy before set_return_msg()
+    # NB: only TTL might be updated in-place. `resmod.py' is an example for TTL case.
+    msg = DNSMessage(qinfo.qname_str, qinfo.qtype, qinfo.qclass,
+        (PKT_QR if flags & QF_BIT_QR else 0) |
+        (PKT_AA if flags & QF_BIT_AA else 0) |
+        (PKT_TC if flags & QF_BIT_TC else 0) |
+        (PKT_RD if flags & QF_BIT_RD else 0) |
+        (PKT_CD if flags & QF_BIT_CD else 0) |
+        (PKT_RA if flags & QF_BIT_RA else 0) |
+        (PKT_AD if flags & QF_BIT_AD else 0))
+    fitness = {}
+    now = time.monotonic()
+    for keyi in range(rep.an_numrrsets):
+        ub_packed_rrset_key = rep.rrsets[keyi]
+        rk = ub_packed_rrset_key.rk
+        is_ip = rk.type in (NET_TYPE_A, NET_TYPE_AAAA) and rk.rrset_class == NET_CLASS_IN
+        data = ub_packed_rrset_key.entry.data # struct packed_rrset_data
+        fitness[(rk.dname, rk.type, rk.rrset_class)] = data.trust, data.security
+        for rri in range(data.count):
+            blob = data.rr_data[rri]
+            if not is_ip or blob not in unwanted:
+                # RFC3597 format
+                msg.answer.append('{:s} {:d} CLASS{:d} TYPE{:d} \\# {:d} {:s}'.format(
+                    rk.dname_str, data.rr_ttl[rri],
+                    ntohs(rk.rrset_class), ntohs(rk.type),
+                    data.rr_len[rri] - 2,
+                    ''.join('{:02X}'.format(c) for c in blob[2:])))
+            elif stash: # is_ip and (blob in unwanted) and (non-empty stash)
+                exp, rrtxt = stash.pop()
+                msg.answer.append('{:s} {:d} {:s}'.format(
+                    rk.dname_str, int(min(data.rr_ttl[rri], exp - now)), rrtxt))
+                log_info('****** {}'.format(msg.answer[-1]))
+
+    # TODO: account for ECS. ECS cache is tricky.
+    # TODO: understand if `authority` and `additional` should be copied.
+    # TODO: understand why is `explanation.invalid` dropped from reply.
+    #   msg.additional.append('explanation.invalid. 0 IN TXT "Deleted unwanted RRs"')
+    invalidateQueryInCache(qstate, qinfo)
+
+    # NB: set_return_msg() updates qstate.return_msg.rep.authoritative using PKT_AA.
+    if not msg.set_return_msg(qstate):
+        log_info('set_return_msg() failed')
+        return False
+
+    # Old `rep` points to pointless point at this point.
+    qinfo, rep = qstate.return_msg.qinfo, qstate.return_msg.rep # new `return_msg`
+
+    # And let the UGLY hack begin. I hope, it does not crash Unbound.
+    # It is needed to put the answer to cache, otherwise the query can't be replied
+    # from cache and the "Cache reply: secure entry changed status" msg is logged.
+    rep.security = security
+    for keyi in range(rep.an_numrrsets):
+        ub_packed_rrset_key = rep.rrsets[keyi]
+        rk = ub_packed_rrset_key.rk
+        data = ub_packed_rrset_key.entry.data
+        data.trust, data.security = fitness[(rk.dname, rk.type, rk.rrset_class)] # KeyError here is a bug
+    # End of the UGLY hack. Much trust. Very verify_request. Lots security. Wow!
+
+    is_referral = 0
+    # Both raw msg and rrset is stored for non-referral queries, bare rrset for referral.
+    if not storeQueryInCache(qstate, qinfo, rep, is_referral):
+        log_info('storeQueryInCache() failed')
+        return False
+
+    return True
+
 """
 MODULE_STATE_INITIAL initial state - new query
 MODULE_WAIT_REPLY    waiting for reply to outgoing network query. It's for `iterator' module.
@@ -238,57 +309,7 @@ def operate(id, event, qstate, qdata):
     if not unwanted: # all is good
         pass
     elif good > 0: # just drop some RRs
-        flags, security = rep.flags, rep.security # copy before set_return_msg()
-        # NB: only TTL might be updated in-place. `resmod.py' is an example for TTL.
-        msg = DNSMessage(qinfo.qname_str, qtype, qclass,
-            (PKT_QR if flags & QF_BIT_QR else 0) |
-            (PKT_AA if flags & QF_BIT_AA else 0) |
-            (PKT_TC if flags & QF_BIT_TC else 0) |
-            (PKT_RD if flags & QF_BIT_RD else 0) |
-            (PKT_CD if flags & QF_BIT_CD else 0) |
-            (PKT_RA if flags & QF_BIT_RA else 0) |
-            (PKT_AD if flags & QF_BIT_AD else 0))
-        fitness = {}
-        for keyi in range(rep.an_numrrsets):
-            ub_packed_rrset_key = rep.rrsets[keyi]
-            rk = ub_packed_rrset_key.rk
-            is_ip = (rk.type == NET_TYPE_A or rk.type == NET_TYPE_AAAA) and rk.rrset_class == NET_CLASS_IN
-            data = ub_packed_rrset_key.entry.data # struct packed_rrset_data
-            fitness[(rk.dname, rk.type, rk.rrset_class)] = data.trust, data.security
-            for rri in range(data.count):
-                blob = data.rr_data[rri]
-                if not is_ip or blob not in unwanted:
-                    # RFC3597 format
-                    msg.answer.append('{:s} {:d} CLASS{:d} TYPE{:d} \\# {:d} {:s}'.format(
-                        rk.dname_str, data.rr_ttl[rri], ntohs(rk.rrset_class), ntohs(rk.type),
-                        data.rr_len[rri] - 2,
-                        ''.join('{:02X}'.format(c) for c in blob[2:])))
-        # TODO: account for ECS. ECS cache is tricky.
-        # TODO: understand if `authority` and `additional` should be copied.
-        # TODO: understand why is `explanation.invalid` dropped from reply.
-        #   msg.additional.append('explanation.invalid. 0 IN TXT "Deleted unwanted RRs"')
-        invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
-        # NB: set_return_msg() updates qstate.return_msg.rep.authoritative using PKT_AA.
-        if not msg.set_return_msg(qstate):
-            log_info('set_return_msg() failed')
-            qstate.ext_state[id] = MODULE_ERROR
-            return True
-        # Old `rep` points to pointless point at this point.
-        rep = qstate.return_msg.rep
-        # And let the UGLY hack begin. I hope, it does not crash Unbound.
-        # It is needed to put the answer to cache, otherwise the query can't be replied
-        # from cache and the "Cache reply: secure entry changed status" msg is logged.
-        rep.security = security
-        for keyi in range(rep.an_numrrsets):
-            ub_packed_rrset_key = rep.rrsets[keyi]
-            rk = ub_packed_rrset_key.rk
-            data = ub_packed_rrset_key.entry.data
-            data.trust, data.security = fitness[(rk.dname, rk.type, rk.rrset_class)] # KeyError here is a bug
-        # End of the UGLY hack. Much trust. Very verify_request. Lots security. Wow!
-        is_referral = 0
-        # Both raw msg and rrset is stored for non-referral queries, bare rrset for referral.
-        if not storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, is_referral):
-            log_info('storeQueryInCache() failed')
+        if not set_crafted_return_msg(qstate, unwanted):
             qstate.ext_state[id] = MODULE_ERROR
             return True
     elif rrcdn is not None:
@@ -312,62 +333,7 @@ def operate(id, event, qstate, qdata):
         if stash:
             stash = stash[:]
             random.shuffle(stash)
-            flags, security = rep.flags, rep.security # copy before set_return_msg()
-            # NB: only TTL might be updated in-place. `resmod.py' is an example for TTL.
-            msg = DNSMessage(qinfo.qname_str, qtype, qclass,
-                (PKT_QR if flags & QF_BIT_QR else 0) |
-                (PKT_AA if flags & QF_BIT_AA else 0) |
-                (PKT_TC if flags & QF_BIT_TC else 0) |
-                (PKT_RD if flags & QF_BIT_RD else 0) |
-                (PKT_CD if flags & QF_BIT_CD else 0) |
-                (PKT_RA if flags & QF_BIT_RA else 0) |
-                (PKT_AD if flags & QF_BIT_AD else 0))
-            fitness = {}
-            for keyi in range(rep.an_numrrsets):
-                ub_packed_rrset_key = rep.rrsets[keyi]
-                rk = ub_packed_rrset_key.rk
-                is_ip = (rk.type == NET_TYPE_A or rk.type == NET_TYPE_AAAA) and rk.rrset_class == NET_CLASS_IN
-                data = ub_packed_rrset_key.entry.data # struct packed_rrset_data
-                fitness[(rk.dname, rk.type, rk.rrset_class)] = data.trust, data.security
-                for rri in range(data.count):
-                    blob = data.rr_data[rri]
-                    if not is_ip or blob not in unwanted:
-                        # RFC3597 format
-                        msg.answer.append('{:s} {:d} CLASS{:d} TYPE{:d} \\# {:d} {:s}'.format(
-                            rk.dname_str, data.rr_ttl[rri], ntohs(rk.rrset_class), ntohs(rk.type),
-                            data.rr_len[rri] - 2,
-                            ''.join('{:02X}'.format(c) for c in blob[2:])))
-                    elif stash:
-                        exp, rrtxt = stash.pop()
-                        msg.answer.append('{:s} {:d} {:s}'.format(
-                            rk.dname_str, int(min(data.rr_ttl[rri], exp - now)), rrtxt))
-                        log_info('****** {}'.format(msg.answer[-1]))
-            # TODO: account for ECS. ECS cache is tricky.
-            # TODO: understand if `authority` and `additional` should be copied.
-            # TODO: understand why is `explanation.invalid` dropped from reply.
-            #   msg.additional.append('explanation.invalid. 0 IN TXT "Deleted unwanted RRs"')
-            invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
-            # NB: set_return_msg() updates qstate.return_msg.rep.authoritative using PKT_AA.
-            if not msg.set_return_msg(qstate):
-                log_info('set_return_msg() failed')
-                qstate.ext_state[id] = MODULE_ERROR
-                return True
-            # Old `rep` points to pointless point at this point.
-            rep = qstate.return_msg.rep
-            # And let the UGLY hack begin. I hope, it does not crash Unbound.
-            # It is needed to put the answer to cache, otherwise the query can't be replied
-            # from cache and the "Cache reply: secure entry changed status" msg is logged.
-            rep.security = security
-            for keyi in range(rep.an_numrrsets):
-                ub_packed_rrset_key = rep.rrsets[keyi]
-                rk = ub_packed_rrset_key.rk
-                data = ub_packed_rrset_key.entry.data
-                data.trust, data.security = fitness[(rk.dname, rk.type, rk.rrset_class)] # KeyError here is a bug
-            # End of the UGLY hack. Much trust. Very verify_request. Lots security. Wow!
-            is_referral = 0
-            # Both raw msg and rrset is stored for non-referral queries, bare rrset for referral.
-            if not storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, is_referral):
-                log_info('storeQueryInCache() failed')
+            if not set_crafted_return_msg(qstate, unwanted, stash):
                 qstate.ext_state[id] = MODULE_ERROR
                 return True
         else:
