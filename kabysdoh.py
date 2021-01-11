@@ -36,6 +36,15 @@ ATTACH_SUB_T = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, query_info_head_p
 
 LOCK = object()
 
+def strAsDname(s):
+    l = []
+    for label in s.encode('ascii').split(b'.'):
+        if len(label) > 0:
+            l.append(bytes((len(label),)))
+            l.append(label)
+    l.append(bytes((0,)))
+    return b''.join(l)
+
 def load_dump(fpath):
     # It takes ~150 ms to load & parse the dump dated 2020-12-26.
     with open(fpath, 'rt') as fd:
@@ -71,6 +80,8 @@ def load_dump(fpath):
                 t1[netaddr] = cdn
         d['{}TrieMask'.format(setname)] = common_mask
         d[setname] = t1
+    for cdn in list(d['cdnDomains']):
+        d['cdnDomains'][cdn] = [strAsDname(_) for _ in d['cdnDomains'][cdn]]
     return d
 
 def init_standard(id, env):
@@ -364,9 +375,12 @@ def operate_on_subquery_results(id, qstate, qdata):
         else:
             qstate.ext_state[id] = MODULE_ERROR
     else:
+        if qdata[SUBQUERY] >= 3:
+            raise RuntimeError('too many sub-queries', rrcdn)
         # TODO: is invalidateQueryInCache needed here before sub-query?
-        sqname = b'\x03www\x0acloudflare\x03com\x00' # TODO: cdnDomains[rrcdn]
+        sqname = random.choice(d['cdnDomains'][qdata[RRCDN]])
         if launch_subquery(qstate, sqname, qdata[STASH_QTYPE]):
+            qdata[SUBQUERY] += 1
             qstate.ext_state[id] = MODULE_WAIT_SUBQUERY
         else:
             qstate.ext_state[id] = MODULE_ERROR
