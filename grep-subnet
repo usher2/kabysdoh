@@ -3,17 +3,36 @@
 from ipaddress import ip_network, ip_address
 import sys
 
+def iter_chunks(fd):
+    chunk = []
+    for line in fd:
+        if line.strip():
+            chunk.append(line)
+        else:
+            yield chunk
+            chunk.clear()
+    if chunk:
+        yield chunk
+
 def main():
     subnets, = sys.argv[1:]
     with open(subnets) as fd:
         subnets = [ip_network(_.strip()) for _ in fd.readlines()]
-    for line in sys.stdin:
-        try:
-            addr = ip_address(line.rsplit(None, 1)[1])
-        except Exception:
-            addr = None
-        if addr is not None and any(addr in n for n in subnets):
-            sys.stdout.write(line)
+    for chunk in iter_chunks(sys.stdin):
+        for line in chunk:
+            try:
+                addr = ip_address(line.rsplit(None, 1)[1])
+            except Exception:
+                addr = None
+            if addr is not None and any(addr in n for n in subnets):
+                match = True
+                break
+        else:
+            match = False
+        if match:
+            for line in chunk:
+                sys.stdout.write(line)
+            sys.stdout.write('\n')
 
 if __name__ == '__main__':
     main()

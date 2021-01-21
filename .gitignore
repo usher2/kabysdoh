@@ -6,6 +6,8 @@ top-1m.AAAA.[1-9]*
 cf-ips-v4
 cf-ips-v6
 cloudflare
+amazon.json
+amazon
 js/[1-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]
 xml/[1-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]
 dump.lua

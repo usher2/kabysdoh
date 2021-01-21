@@ -54,14 +54,15 @@ def rkn_or_cdn(files):
 
 def parse_cdn(cdn):
     cdn4, cdn6 = [], []
+    known = set()
     for fname in cdn:
         name = os.path.basename(fname)
         with open(fname) as fd:
             net = [ip_network(_.strip()) for _ in fd.readlines()]
+            assert all(not k.overlaps(n) for k in known for n in net)
+            known.update(net)
         net4 = [n for n in net if n.version == 4]
         net6 = [n for n in net if n.version == 6]
-        assert all(not c.overlaps(n) for c in cdn4 for n in net4)
-        assert all(not c.overlaps(n) for c in cdn6 for n in net6)
         cdn4.extend((str(n), name) for n in net4)
         cdn6.extend((str(n), name) for n in net6)
     return cdn4, cdn6
@@ -82,6 +83,8 @@ def is_in_cdn(domain, net, name):
 
 def verify_domains(cdn4, cdn6):
     # www or not-www? Just take the "default" webpage domain.
+    # NB: nike.com is Amazon CloudFront and it redirects to www.nike.com. The latter is Akamai Edge.
+    # www.flickr.com is the only dual-stack domain in amazon set.
     cdnDomains = {
         'cloudflare': [
             'medium.com.',
@@ -95,13 +98,27 @@ def verify_domains(cdn4, cdn6):
             'www.sciencedirect.com.',
             'www.webmd.com.',
         ],
+        'amazon': [
+            'www.tradingview.com.',
+            'www.imdb.com.',
+            'www.amazon.co.uk.',
+            'soundcloud.com.',
+            'www.reuters.com.',
+            'www.marketwatch.com.',
+            'www.flickr.com.',
+            'www.merriam-webster.com.',
+            'tinder.com.',
+            'www.surveymonkey.com.',
+        ],
     }
     known_names = {name for _, name in cdn4 + cdn6}
     assert all(name in cdnDomains for name in known_names)
     for name in known_names:
         net = [ip_network(n) for n, _ in cdn4 + cdn6 if _ == name]
         cdnDomains[name] = [d for d in cdnDomains[name] if is_in_cdn(d, net, name)]
-        # empty cdnDomains is not fatal as DNS server may learn new CDN domains in runtime.
+        # empty cdnDomains should not be fatal as DNS server may learn new CDN domains in runtime.
+        if not cdnDomains[name]:
+            raise RuntimeError('no valid domains for CDN', name)
     return cdnDomains
 
 def main():
