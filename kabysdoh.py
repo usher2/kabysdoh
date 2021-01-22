@@ -6,7 +6,7 @@ import random
 import threading
 import time
 
-DUMP_PATH = '/mnt/dump.pyjson'
+DUMP_PATH = '/srv/kabysdoh/kabydump.pyjson'
 # MGMT_ADDR = ('::1', 24066)
 # MGMT_METRICS_ACL = []
 # MGMT_API_ACL = []
@@ -208,7 +208,7 @@ def set_crafted_return_msg(qstate, unwanted, stash=None):
 
     # TODO: account for ECS. ECS cache is tricky.
     # TODO: understand if `authority` and `additional` should be copied.
-    # TODO: understand why is `explanation.invalid` dropped from reply.
+    # TODO: understand why is `explanation.invalid` dropped from reply. Is it "minimal-responses"?
     #   msg.additional.append('explanation.invalid. 0 IN TXT "Deleted unwanted RRs"')
     invalidateQueryInCache(qstate, qinfo)
 
@@ -313,8 +313,8 @@ def operate(id, event, qstate, qdata):
         qstate.ext_state[id] = MODULE_FINISHED
         return True
 
-    if not has_reply: # how is MODULE_EVENT_MODDONE possible without return_msg?!
-        log_query_info(NO_VERBOSE, 'WAT?! operate(): event:{} qdata:{} has_reply:{} is_external:{} qinfo:'.format(
+    if not has_reply:
+        log_query_info(NO_VERBOSE, 'Dead NS? operate(): event:{} qdata:{} has_reply:{} is_external:{} qinfo:'.format(
             strmodulevent(event), qdata, has_reply, is_external), qinfo)
         qstate.ext_state[id] = MODULE_FINISHED
         return True

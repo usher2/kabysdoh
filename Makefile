@@ -24,7 +24,7 @@ js/% : xml/%
 	./parse-xml $^ $@
 dump.lua :
 	./merge js/* | ./format-lua $@
-dump.pyjson : cloudflare amazon
+kabydump.pyjson : cloudflare amazon
 	./merge cloudflare amazon js/* | ./format-pyjson $@
 
 run-cloudflare-top : top-1m.csv cloudflare
@@ -40,9 +40,20 @@ top-1m.csv.zip :
 top-1m.csv : top-1m.csv.zip
 	unzip -n top-1m.csv.zip
 
+unbound.log :
+	touch $@ && chmod 666 $@ # to avoid UID remaping
+
+ssl/snakeoil :
+	mkdir -p ssl
+	cd ssl && make-ssl-cert /usr/share/ssl-cert/ssleay.cnf snakeoil # see apt:ssl-cert
+ssl/fullchain.pem : ssl/snakeoil
+	openssl x509 -in $^ -out $@
+ssl/privkey.pem : ssl/snakeoil
+	openssl rsa -in $^ -out $@
+
 build-unbound :
-	tar cz Dockerfile | docker build -t darkk/unbound -f Dockerfile -
-run-unbound :
-	docker run --rm -ti --net=host -v $$PWD:/mnt darkk/unbound:latest
-#push-unbound :
-#	docker push darkk/unbound
+	tar cz Dockerfile kabysdoh.py | docker build -t darkk/kabysdoh-unbound -f Dockerfile -
+run-unbound : ssl/privkey.pem ssl/fullchain.pem unbound.log
+	docker run --rm -ti --net=host -v $$PWD:/srv/kabysdoh darkk/kabysdoh-unbound:latest
+push-unbound :
+	docker push darkk/kabysdoh-unbound
